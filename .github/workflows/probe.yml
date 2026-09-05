@@ -1,0 +1,52 @@
+name: anyrouter 上游探測
+on:
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 強制發 Telegram（即使無變化）
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: 1
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+      with:
+        version: "latest"
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: 恢復上次探測狀態
+      uses: actions/cache@v5
+      id: probe-state-cache
+      with:
+        path: probe_state.json
+        key: probe-state-${{ github.run_id }}
+        restore-keys: |
+          probe-state-
+
+    - name: 安裝依賴
+      run: |
+        uv sync --frozen
+        echo "✅ 依賴就緒"
+
+    - name: 探測 anyrouter Claude 上游
+      env:
+        ANYROUTER_API_KEY: ${{ secrets.ANYROUTER_API_KEY }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        FORCE_NOTIFY: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.force == 'true') && '1' || '' }}
+      run: |
+        uv run probe_anyrouter.py
