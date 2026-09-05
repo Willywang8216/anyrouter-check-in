@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""anyrouter.top Claude 上游可用性探測器
+"""anyrouter.top LLM 上游可用性探測器（動態 model 清單）
 
-用「Claude Code 偽裝」headers 對候選 claude model 發極小請求(max_tokens=1)，
-判斷哪些現在真的能用(HTTP 200)。上游時好時壞(全 503 常見)，這支定期探測，
-可用清單一變化就 Telegram 通知，讓你知道「現在可以走哪個 model」。
+每輪先 GET /v1/models 拿「當前存在的全部 model」，逐一發極小請求(max_tokens=1)測可用性。
+claude* 走 anthropic /v1/messages（帶「Claude Code 偽裝」headers）；
+其它（gpt/gemini/codex…）先試 openai /v1/chat/completions，回「不支持所选模型」再試 /v1/responses。
 
-偽裝關鍵 header（即 Claude Code 自動帶、一般 API 工具不會帶的）：
-  anthropic-beta: context-1m-2025-08-07        ← anyrouter 檢查「啟用 1m 上下文」
+可用清單(HTTP 200)一變化就 Telegram 通知；全掛時安靜。
+
+偽裝關鍵 header（Claude Code 自動帶、一般工具不會）：
+  anthropic-beta: context-1m-2025-08-07
   anthropic-dangerous-direct-browser-access: true
   User-Agent: claude-cli/... (Claude Code)
 
-env：
-  ANYROUTER_API_KEY  必需（anyrouter 帳號 sk- token）
-  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  通知用（沒設則不發）
-  FORCE_NOTIFY=1     強制發通知（測試用）
-  ANYROUTER_BASE     預設 https://anyrouter.top
+env：ANYROUTER_API_KEY(必需)、TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID、FORCE_NOTIFY=1、ANYROUTER_BASE
 """
 import json
 import os
@@ -33,18 +31,12 @@ if hasattr(sys.stdout, 'reconfigure'):
 DOMAIN = os.environ.get('ANYROUTER_BASE', 'https://anyrouter.top').rstrip('/')
 STATE_FILE = 'probe_state.json'
 
-# (model id, kind)  kind: an=anthropic messages / oa=openai chat
-MODELS = [
-    ('claude-opus-4-7', 'an'),
-    ('claude-opus-4-6', 'an'),
-    ('claude-opus-4-5-20251101', 'an'),
-    ('claude-opus-4-20250514', 'an'),
-    ('claude-sonnet-4-5-20250929', 'an'),
-    ('claude-sonnet-4-20250514', 'an'),
-    ('claude-fable-5-1', 'an'),
-    ('claude-opus-4-1-20250805', 'an'),
-    ('claude-haiku-4-5-20251001', 'an'),
-    ('gpt-5-codex', 'oa'),
+# fallback：若 /v1/models 抓不到時的 model 清單
+FALLBACK_MODELS = [
+    'claude-opus-4-7', 'claude-opus-4-6', 'claude-opus-4-5-20251101',
+    'claude-opus-4-20250514', 'claude-sonnet-4-5-20250929', 'claude-sonnet-4-20250514',
+    'claude-fable-5-1', 'claude-opus-4-1-20250805', 'claude-haiku-4-5-20251001',
+    'gpt-5-codex',
 ]
 
 AN_HEADERS = {
@@ -54,6 +46,32 @@ AN_HEADERS = {
     'anthropic-dangerous-direct-browser-access': 'true',
     'User-Agent': 'claude-cli/2.1.0 (Claude Code)',
 }
+OA_HEADERS = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'codex_cli_rs/0.114.0',
+}
+
+
+def fetch_models(client, key):
+    """動態取得站上全部 model id。"""
+    try:
+        r = client.get(f'{DOMAIN}/v1/models',
+                       headers={'Authorization': f'Bearer {key}', 'User-Agent': 'curl/8.0'}, timeout=30)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            ids = []
+            for m in data:
+                if isinstance(m, dict):
+                    ids.append(m.get('id') or m.get('name') or '')
+                else:
+                    ids.append(str(m))
+            ids = sorted(set(i for i in ids if i))
+            if ids:
+                return ids
+    except Exception as e:  # noqa: BLE001
+        print(f'[WARN] fetch /v1/models failed: {str(e)[:80]}')
+    print(f'[WARN] use fallback model list ({len(FALLBACK_MODELS)})')
+    return FALLBACK_MODELS
 
 
 def load_state():
@@ -74,14 +92,13 @@ def save_state(state):
         print(f'[WARN] save state failed: {e}')
 
 
-def classify(model, code, body_text):
+def classify(code, body_text, model):
     if code == 200:
         return 'UP'
     if code == 429:
         return 'LIMIT'
     if code >= 500:
         return 'DOWN'
-    # 4xx：看訊息歸類
     if '已下线' in body_text:
         return 'OFFLINE'
     if '1m 上下文' in body_text or '启用 1m' in body_text or '啟用 1m' in body_text:
@@ -91,37 +108,70 @@ def classify(model, code, body_text):
     return f'ERR{code}'
 
 
-def check_one(client, key, model, kind):
+def try_anthropic(client, key, model):
+    body = {'model': model, 'max_tokens': 1,
+            'messages': [{'role': 'user', 'content': 'ping'}], 'stream': False}
+    r = client.post(f'{DOMAIN}/v1/messages',
+                    headers={**AN_HEADERS, 'Authorization': f'Bearer {key}'},
+                    json=body, timeout=60)
+    return r
+
+
+def try_chat(client, key, model):
+    body = {'model': model, 'max_tokens': 1, 'messages': [{'role': 'user', 'content': 'ping'}]}
+    r = client.post(f'{DOMAIN}/v1/chat/completions',
+                    headers={**OA_HEADERS, 'Authorization': f'Bearer {key}'},
+                    json=body, timeout=60)
+    return r
+
+
+def try_responses(client, key, model):
+    body = {'model': model, 'input': [{'role': 'user', 'content': 'ping'}], 'store': False}
+    r = client.post(f'{DOMAIN}/v1/responses',
+                    headers={**OA_HEADERS, 'Authorization': f'Bearer {key}'},
+                    json=body, timeout=60)
+    return r
+
+
+def extract_msg(r):
     try:
-        if kind == 'an':
-            body = {'model': model, 'max_tokens': 1,
-                    'messages': [{'role': 'user', 'content': 'ping'}], 'stream': False}
-            r = client.post(f'{DOMAIN}/v1/messages', headers={**AN_HEADERS, 'Authorization': f'Bearer {key}'},
-                            json=body, timeout=60)
-        else:
-            body = {'model': model, 'max_tokens': 1,
-                    'messages': [{'role': 'user', 'content': 'ping'}]}
-            h = {'Content-Type': 'application/json', 'Authorization': f'Bearer {key}',
-                 'User-Agent': 'codex_cli_rs/0.114.0'}
-            r = client.post(f'{DOMAIN}/v1/chat/completions', headers=h, json=body, timeout=60)
+        j = r.json()
+        if isinstance(j, dict):
+            err = j.get('error')
+            if isinstance(err, dict):
+                return err.get('message') or ''
+            if isinstance(err, str):
+                return err
+            return j.get('message') or ''
+    except Exception:  # noqa: BLE001
+        pass
+    return r.text[:100]
+
+
+def check_one(client, key, model):
+    """對單一 model 探測。claude→anthropic；其它→chat，404 才補 responses。回 (code,cls,note)。"""
+    low = model.lower()
+    try:
+        if 'claude' in low:
+            r = try_anthropic(client, key, model)
+            note = extract_msg(r)
+            return r.status_code, classify(r.status_code, note, model), note[:70]
+        # 非 claude：先 chat/completions
+        r = try_chat(client, key, model)
+        note = extract_msg(r)
         code = r.status_code
-        try:
-            j = r.json()
-            msg = ''
-            if isinstance(j, dict):
-                err = j.get('error')
-                if isinstance(err, dict):
-                    msg = err.get('message') or ''
-                elif isinstance(err, str):
-                    msg = err
-                else:
-                    msg = j.get('message') or ''
-            body_text = (msg or r.text)
-        except Exception:  # noqa: BLE001
-            body_text = r.text[:100]
-        return code, classify(model, code, body_text), body_text[:80]
+        if code == 200:
+            return 200, 'UP', ''
+        # 若 404「不支持」(例如 codex model 需 responses)，補試 responses
+        if code == 404 and ('不支持所选模型' in note or 'responses' in note.lower() or 'codex' in low):
+            r2 = try_responses(client, key, model)
+            note2 = extract_msg(r2)
+            if r2.status_code == 200:
+                return 200, 'UP', ''
+            return r2.status_code, classify(r2.status_code, note2, model), note2[:70]
+        return code, classify(code, note, model), note[:70]
     except Exception as e:  # noqa: BLE001
-        return 0, 'ERR', str(e)[:80]
+        return 0, 'ERR', str(e)[:70]
 
 
 def tg_send(bot, chat, title, text):
@@ -151,51 +201,47 @@ def main():
     chat = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
     force = os.environ.get('FORCE_NOTIFY', '').lower() in ('1', 'true', 'yes')
 
-    state = load_state()
-    prev_available = set(state.get('available', []))
-
     client = httpx.Client(http2=True, timeout=60)
-    results = {}
-    available = []
     try:
-        for model, kind in MODELS:
-            code, cls, note = check_one(client, key, model, kind)
-            results[model] = {'code': code, 'cls': cls}
-            print(f'[{model}] {cls} (HTTP {code}) {note[:60]}')
+        models = fetch_models(client, key)
+        print(f'[INFO] probing {len(models)} models')
+        results = {}
+        available = []
+        for m in models:
+            code, cls, note = check_one(client, key, m)
+            results[m] = {'code': code, 'cls': cls}
+            print(f'[{m}] {cls} (HTTP {code}) {note[:50]}')
             if cls == 'UP':
-                available.append(model)
-            time.sleep(0.4)
+                available.append(m)
+            time.sleep(0.35)
     finally:
         client.close()
 
+    state = load_state()
+    prev_available = set(state.get('available', []))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     changed = set(available) != prev_available
     save_state({'available': available, 'all': results, 'ts': now})
 
     if not changed and not force:
         print(f'[INFO] no change (UP={len(available)}), skip notify')
-        if not available:
-            print('[INFO] all models down, quiet')
         return
 
     lines = []
-    for model, kind in MODELS:
-        r = results[model]
+    for m in models:
+        r = results[m]
         sym = SYM.get(r['cls'], '❓')
-        extra = ' (站方已下線，叫你用 4-7)' if model == 'claude-opus-4-6' else ''
-        lines.append(f'{sym} {model}{extra}')
+        lines.append(f'{sym} {m}')
     if not available:
         lines.append('')
-        lines.append('全部 503 / 無可用上游，等站方補貨中')
+        lines.append('全部無可用上游，等站方補貨中')
 
-    status_line = f'可用 {len(available)}/{len(MODELS)}'
-    note = ('\n(站上無 claude-opus-4-8，最高 opus-4-7；4-6 已被站方下線)'
-            if 'claude-opus-4-7' in available else '')
-    text = '\n'.join(lines) + '\n\n' + status_line + note
+    text = '\n'.join(lines) + f'\n\n可用 {len(available)}/{len(models)}'
+    if 'claude-opus-4-7' not in models:
+        text += '\n(站上無 claude-opus-4-8；4-6 已被下線)'
     title = f'anyrouter 上游探測 {now}'
     ok = tg_send(bot, chat, title, text) if (bot and chat) else False
-    if bot and chat and not ok:
-        print('[WARN] telegram send failed')
     print(f'[DONE] UP={available} changed={changed} tg={ok if (bot and chat) else "no-env"}')
 
 
