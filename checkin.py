@@ -11,13 +11,18 @@ import sys
 from datetime import datetime
 
 if hasattr(sys.stdout, 'reconfigure'):
-	sys.stdout.reconfigure(line_buffering=True)
+	# Windows 本机默认 stdout 编码可能是 cp950/big5，会卡在框线字符（如 ━）上，强制 utf-8
+	sys.stdout.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
 if hasattr(sys.stderr, 'reconfigure'):
-	sys.stderr.reconfigure(line_buffering=True)
+	sys.stderr.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
 
 import httpx
 from cloakbrowser import launch_async
 from dotenv import load_dotenv
+
+# 提早加载 .env：utils.notify 在 import 时就读取环境变量，
+# 若在这之后才 load_dotenv()，本机（无 Actions 注入 env）会拿不到 Telegram 等通知配置
+load_dotenv()
 
 from utils.browser import (
 	BrowserLoginResult,
@@ -37,8 +42,6 @@ from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
-
-load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
