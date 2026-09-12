@@ -47,12 +47,17 @@ class ProviderConfig:
 		配置格式:
 		- 基础: {"domain": "https://example.com"}
 		- 完整: {"domain": "https://example.com", "login_path": "/login", "use_proxy": true, ...}
+		- 覆写内置 provider: {"use_proxy": false}（可省略 domain，继承内置默认值）
 		"""
+		domain = data.get('domain', defaults.domain if defaults else None)
+		if not domain:
+			raise ValueError('provider config requires "domain"')
+
 		default_use_proxy = defaults.use_proxy if defaults else False
 		default_persist_profile = defaults.persist_profile if defaults else False
 		return cls(
 			name=name,
-			domain=data['domain'],
+			domain=domain,
 			login_path=data.get('login_path', defaults.login_path if defaults else '/login'),
 			sign_in_path=data.get('sign_in_path', defaults.sign_in_path if defaults else '/api/user/sign_in'),
 			user_info_path=data.get('user_info_path', defaults.user_info_path if defaults else '/api/user/self'),
