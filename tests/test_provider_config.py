@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from utils.config import AppConfig, ProviderConfig
 
 
@@ -47,3 +49,17 @@ def test_provider_from_dict_inherits_profile_persistence_from_defaults():
 	)
 
 	assert provider.persist_profile is True
+
+
+def test_builtin_provider_can_be_overridden_without_domain(monkeypatch):
+	monkeypatch.setenv('PROVIDERS', json.dumps({'agentrouter': {'use_proxy': False}}))
+
+	config = AppConfig.load_from_env()
+
+	assert config.providers['agentrouter'].domain == 'https://agentrouter.org'
+	assert config.providers['agentrouter'].use_proxy is False
+
+
+def test_custom_provider_without_domain_is_rejected():
+	with pytest.raises(ValueError, match='domain'):
+		ProviderConfig.from_dict('custom', {'use_proxy': False})
